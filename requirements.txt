@@ -1,0 +1,31 @@
+# NLS Historic Map Tools — Python dependencies
+#
+# Install all:
+#   pip install -r requirements.txt
+#
+# For the geocoder (nls_map_geocoder_llm.py) you also need the system
+# Tesseract binary for the OCR fallback variant:
+#   macOS:  brew install tesseract
+#   Ubuntu: sudo apt install tesseract-ocr
+
+# ── Core (used by all scripts) ───────────────────────────────────────────────
+# nls_map_downloader.py and nls_map_seamless_downloader.py use only stdlib,
+# but Pillow is needed for the optional --assemble flag in both.
+Pillow>=12.0.0
+
+# ── OCR geocoder (nls_map_geocoder_ocr.py) ───────────────────────────────────
+pytesseract>=0.3.13
+
+# ── LLM geocoder (nls_map_geocoder_llm.py) ───────────────────────────────────
+# PyTorch — install the CPU build by default; for GPU see note below.
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.51.0
+accelerate>=0.26.0
+qwen-vl-utils>=0.0.8
+
+# ── GPU / Apple Silicon note ─────────────────────────────────────────────────
+# The default torch wheel above is CPU-only.
+# For NVIDIA CUDA (replace cu121 with your CUDA version):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# For Apple Silicon MPS, the standard wheel works — no extra steps needed.
