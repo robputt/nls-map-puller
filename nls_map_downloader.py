@@ -214,7 +214,7 @@ def query_maps(lat: float, lon: float, typename: str,
 
 def get_iiif_info(image_id: str) -> dict | None:
     """Fetch IIIF Image API info.json for a given NLS image ID."""
-    folder = image_id[:4]
+    folder = image_id[:-4]  # e.g. 74426700 -> 7442, 102352955 -> 10235
     url = f"{IIIF_BASE}/{folder}%2F{image_id}/info.json"
     req = urllib.request.Request(url, headers=HEADERS)
     try:
@@ -225,23 +225,63 @@ def get_iiif_info(image_id: str) -> dict | None:
         return None
 
 
+# Tracks consecutive server errors so the caller can back off globally
+_consecutive_errors = 0
+_BASE_DELAY = 0.05       # normal inter-tile pause (seconds)
+_backoff_until = 0.0     # epoch time before which we must wait
+
+
+def _throttle():
+    """Sleep until any active back-off period has elapsed."""
+    remaining = _backoff_until - time.monotonic()
+    if remaining > 0:
+        print(f"\n  [backoff] waiting {remaining:.1f}s …", end="\r", flush=True)
+        time.sleep(remaining)
+
+
 def download_tile(image_id: str, region: str, size: str, out_path: Path,
-                  retries: int = 3) -> bool:
-    """Download a single IIIF tile to out_path."""
-    folder = image_id[:4]
+                  retries: int = 8) -> bool:
+    """Download a single IIIF tile with exponential back-off on server errors."""
+    global _consecutive_errors, _backoff_until
+
+    folder = image_id[:-4]
     url = f"{IIIF_BASE}/{folder}%2F{image_id}/{region}/{size}/0/default.jpg"
     req = urllib.request.Request(url, headers=HEADERS)
 
     for attempt in range(retries):
+        _throttle()
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 out_path.write_bytes(r.read())
+            # Success — reset error streak
+            _consecutive_errors = 0
             return True
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1))
+
+        except urllib.error.HTTPError as e:
+            # Retryable server-side errors
+            if e.code in (429, 500, 502, 503, 504):
+                _consecutive_errors += 1
+                # Exponential back-off: 5s, 10s, 20s, 40s … capped at 5 min
+                wait = min(5 * 2 ** attempt, 300)
+                _backoff_until = time.monotonic() + wait
+                print(f"\n  [HTTP {e.code}] attempt {attempt+1}/{retries} — "
+                      f"backing off {wait}s", flush=True)
+                time.sleep(wait)
             else:
-                print(f"[WARN] Failed to download tile {url}: {e}", file=sys.stderr)
+                # Non-retryable (404, 403, …)
+                print(f"\n  [WARN] HTTP {e.code} for tile — skipping.", file=sys.stderr)
+                _consecutive_errors = 0
+                return False
+
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            _consecutive_errors += 1
+            wait = min(5 * 2 ** attempt, 300)
+            _backoff_until = time.monotonic() + wait
+            print(f"\n  [network error] attempt {attempt+1}/{retries}: {e} — "
+                  f"backing off {wait}s", flush=True)
+            time.sleep(wait)
+
+    print(f"\n  [WARN] Gave up on tile after {retries} attempts: {url}", file=sys.stderr)
     return False
 
 
@@ -301,7 +341,9 @@ def download_map_tiles(image_id: str, out_dir: Path,
             if download_tile(image_id, region, size, tile_path):
                 ok += 1
             print(f"  [{ok}/{total}] tile ({row},{col})", end="\r", flush=True)
-            time.sleep(0.05)  # polite rate limiting
+            # Slow down the base rate if the server has been struggling
+            pause = _BASE_DELAY * (2 ** min(_consecutive_errors, 4))
+            time.sleep(pause)
 
     print(f"  Downloaded {ok}/{total} tiles → {out_dir}")
     return ok == total
