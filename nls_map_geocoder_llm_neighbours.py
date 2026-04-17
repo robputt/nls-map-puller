@@ -299,31 +299,50 @@ def _parse_response(raw: str) -> list[dict]:
 # Deduplication
 # ---------------------------------------------------------------------------
 
-def deduplicate(rows: list[tuple], radius_m: float) -> list[tuple]:
+def deduplicate(rows: list[tuple], radius_m: float, neighbour_radius: int) -> list[tuple]:
     """
-    Cluster rows that are within radius_m of each other and share the same
-    normalised label text (case-insensitive). Within each cluster, keep the
-    row whose label is longest (most complete). Ties are broken by keeping
-    the row with the highest VLM confidence proxy — label length — then
-    whichever came first.
+    Cluster rows that are candidates for being the same label instance.
+
+    Two rows are candidates only if:
+      1. Their centre tiles are within neighbour_radius steps of each other
+         (meaning their composites overlap and could both have seen the label), AND
+      2. Their label text matches (case-insensitive, or one is a substring), AND
+      3. Their coordinates are within radius_m of each other.
+
+    Within each cluster the longest (most complete) label wins.
 
     rows: list of (label, type, lat, lon, zoom, tile_x, tile_y, source)
     """
-    # Each entry: the current best row for a cluster
     clusters: list[tuple] = []
 
     for row in rows:
         label, lat, lon = row[0], row[2], row[3]
+        tile_x, tile_y  = row[5], row[6]
         norm = label.lower().strip()
 
         matched = False
         for idx, rep in enumerate(clusters):
-            rep_norm = rep[0].lower().strip()
-            # Same normalised text (or one is a substring of the other)
-            # and close enough geographically
-            if (norm == rep_norm or norm in rep_norm or rep_norm in norm) \
-                    and haversine_m(lat, lon, rep[2], rep[3]) <= radius_m:
-                # Keep whichever label is longer (more complete)
+            rep_norm   = rep[0].lower().strip()
+            rep_tile_x = rep[5]
+            rep_tile_y = rep[6]
+
+            # Only consider merging if the composites could overlap
+            tiles_adjacent = (
+                abs(tile_x - rep_tile_x) <= neighbour_radius and
+                abs(tile_y - rep_tile_y) <= neighbour_radius
+            )
+            if not tiles_adjacent:
+                continue
+
+            text_matches = (
+                norm == rep_norm or
+                norm in rep_norm or
+                rep_norm in norm
+            )
+            if not text_matches:
+                continue
+
+            if haversine_m(lat, lon, rep[2], rep[3]) <= radius_m:
                 if len(label) > len(rep[0]):
                     clusters[idx] = row
                 matched = True
@@ -410,17 +429,20 @@ def cmd_index(args):
     if not tile_index:
         sys.exit("[ERROR] No valid {z}_{x}_{y} tile files found.")
 
-    radius    = args.neighbour_radius
-    grid      = 2 * radius + 1
-    dedup_r   = args.dedup_radius
-    db_path   = Path(args.db)
-    conn      = open_db(db_path)
+    radius  = args.neighbour_radius
+    grid    = 2 * radius + 1
+    dedup_r = args.dedup_radius
+    db_path = Path(args.db)
+    conn    = open_db(db_path)
     model, processor = load_model(args.model)
 
-    centres = sorted(tile_index.keys())
+    # centres sorted by (ty, tx) so we process row by row
+    centres = sorted(tile_index.keys(), key=lambda c: (c[1], c[0]))
     print(f"\nIndexing {len(centres)} tiles as {grid}×{grid} composites → {db_path}\n")
 
-    all_rows: list[tuple] = []
+    # pending[(cx, cy)] = list of rows produced by composites that have seen this tile
+    pending: dict[tuple[int, int], list[tuple]] = {}
+    total_written = 0
 
     for i, (cx, cy) in enumerate(centres, 1):
         print(f"  [{i}/{len(centres)}] centre tile z{zoom}/{cx}/{cy}", end="  ", flush=True)
@@ -428,37 +450,73 @@ def cmd_index(args):
         composite, tile_w, tile_h, origin_x, origin_y = build_composite(
             cx, cy, zoom, tile_index, radius,
         )
-
         features = analyse_image(composite, model, processor)
 
-        rows = []
+        # Distribute each extracted label into the pending bucket of every
+        # tile whose neighbourhood this composite covers.
+        new_rows = []
         for feat in features:
             lat, lon = composite_frac_to_latlon(
                 feat["x_frac"], feat["y_frac"],
                 zoom, origin_x, origin_y, tile_w, tile_h, grid,
             )
-            rows.append((
+            row = (
                 feat["label"], feat["type"],
                 lat, lon,
                 zoom, cx, cy,
                 f"composite({cx},{cy},r={radius})",
-            ))
+            )
+            new_rows.append(row)
+            # Add to every tile in this composite's footprint that exists
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    neighbour = (cx + dx, cy + dy)
+                    if neighbour in tile_index:
+                        pending.setdefault(neighbour, []).append(row)
 
-        all_rows.extend(rows)
+        summary = ", ".join(f"{r[0]} ({r[1]})" for r in new_rows[:3])
+        if len(new_rows) > 3:
+            summary += f" … +{len(new_rows)-3} more"
+        print(f"→ {len(new_rows)} labels" + (f": {summary}" if new_rows else ""))
 
-        summary = ", ".join(f"{r[0]} ({r[1]})" for r in rows[:3])
-        if len(rows) > 3:
-            summary += f" … +{len(rows)-3} more"
-        print(f"→ {len(rows)} labels" + (f": {summary}" if rows else ""))
+        # A tile (tx, ty) is fully covered once every composite that could
+        # have seen it has been processed. The last such composite is centred
+        # at (tx + radius, ty + radius) in sorted order. After processing
+        # composite (cx, cy), flush any tile (tx, ty) where:
+        #   tx + radius <= cx  AND  ty + radius <= cy
+        # i.e. no future composite can add more labels for that tile.
+        to_flush = [
+            t for t in list(pending.keys())
+            if t[0] + radius <= cx and t[1] + radius <= cy
+        ]
+        for t in to_flush:
+            tile_rows = pending.pop(t)
+            deduped   = deduplicate(tile_rows, dedup_r, radius)
+            insert_labels(conn, deduped)
+            total_written += len(deduped)
+            print(
+                f"  → DB write: tile z{zoom}/{t[0]}/{t[1]} fully covered "
+                f"({len(tile_rows)} raw → {len(deduped)} labels stored, "
+                f"{total_written} total)",
+                flush=True,
+            )
 
-    # Deduplicate across all composites before writing to DB
-    print(f"\nDeduplicating {len(all_rows)} raw labels (radius={dedup_r}m) …", flush=True)
-    deduped = deduplicate(all_rows, dedup_r)
-    print(f"  {len(all_rows)} → {len(deduped)} after deduplication")
+    # Flush whatever remains (edge tiles whose last composite was the final one)
+    if pending:
+        print(f"\nFlushing {len(pending)} remaining edge tile(s) …")
+        for t, tile_rows in pending.items():
+            deduped = deduplicate(tile_rows, dedup_r, radius)
+            insert_labels(conn, deduped)
+            total_written += len(deduped)
+            print(
+                f"  → DB write: tile z{zoom}/{t[0]}/{t[1]} (edge) "
+                f"({len(tile_rows)} raw → {len(deduped)} labels stored, "
+                f"{total_written} total)",
+                flush=True,
+            )
 
-    insert_labels(conn, deduped)
     conn.close()
-    print(f"\nDone. {len(deduped)} labels indexed into {db_path}")
+    print(f"\nDone. {total_written} labels indexed into {db_path}")
 
 
 # ---------------------------------------------------------------------------
