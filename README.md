@@ -13,25 +13,32 @@ No API key required. All maps are CC-BY licensed.
 |--------|-------------|
 | `nls_map_downloader.py` | Downloads individual paper map sheets (IIIF tiles) for a lat/lon point |
 | `nls_map_seamless_downloader.py` | Downloads seamless XYZ mosaic tiles for a bounding box |
-| `nls_map_geocoder.py` | OCRs downloaded tiles to build a reverse-geocoding index |
+| `nls_map_geocoder_llm.py` | Indexes tiles with Qwen3-VL and builds a reverse-geocoding database (recommended) |
+| `nls_map_geocoder_ocr.py` | Indexes tiles with Tesseract OCR — lightweight but noisier |
 
 ---
 
 ## Requirements
 
-Python 3.10+. Install dependencies into a virtual environment:
+Python 3.10+. Install all dependencies into a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install Pillow pytesseract
+pip install -r requirements.txt
 ```
 
-For the geocoder, Tesseract must also be installed on your system:
+For the OCR geocoder, Tesseract must also be installed on your system:
 
 ```bash
-brew install tesseract        # macOS
+brew install tesseract          # macOS
 sudo apt install tesseract-ocr  # Debian/Ubuntu
+```
+
+For NVIDIA GPU acceleration with the LLM geocoder, replace the default CPU torch wheel:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
 ---
@@ -159,14 +166,34 @@ nls_seamless/
 
 ---
 
-## `nls_map_geocoder.py` — Historic map reverse geocoder
+## Geocoders
 
-OCRs downloaded seamless tiles to extract place name labels, stores them in a
-SQLite database with their geographic coordinates, and lets you query what the
-historic map called any given location.
+Two geocoder implementations are provided. Both share the same three-step
+workflow (download → index → query) and the same SQLite query interface.
 
-> Best results at zoom 15–16 where map text is large enough for reliable OCR.
-> Zoom 14 works but yields fewer labels per tile.
+### `nls_map_geocoder_llm.py` — VLM geocoder (recommended)
+
+Uses [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct),
+a local vision-language model, to read map tiles. Unlike raw OCR, the VLM
+understands cartographic context — it distinguishes place names from contour
+labels, classifies features by type (place, road, water, building, etc.), and
+estimates each label's position within the tile.
+
+The model (~8 GB) is downloaded from HuggingFace on first run and cached locally.
+
+**Install dependencies:**
+
+```bash
+pip install torch torchvision transformers accelerate qwen-vl-utils
+```
+
+**Hardware:**
+
+| Hardware | Speed |
+|----------|-------|
+| Apple Silicon M2 Pro+ (16 GB) | ~4–10 tok/s via MPS |
+| NVIDIA GPU 8 GB+ VRAM | ~10–25 tok/s via CUDA |
+| CPU only | ~0.5–2 tok/s — use `--model Qwen/Qwen3-VL-2B-Instruct` |
 
 ### Step 1 — Download tiles
 
@@ -174,40 +201,46 @@ historic map called any given location.
 python3 nls_map_seamless_downloader.py \
   --tl-lat 50.42 --tl-lon -4.18 \
   --br-lat 50.32 --br-lon -4.02 \
-  --layer os_6inch --zoom 15
+  --layer os_6inch --zoom 14
 ```
 
 ### Step 2 — Build the index
 
 ```bash
-python3 nls_map_geocoder.py index --tiles nls_seamless/os_6inch/15
-```
+python3 nls_map_geocoder_llm.py index --tiles nls_seamless/os_6inch/14
 
-This OCRs every tile and stores extracted labels in `nls_geocoder.db`. Re-runs
-skip nothing (use a fresh `--db` path if you want to re-index).
+# Use the smaller 2B model on CPU
+python3 nls_map_geocoder_llm.py index --tiles nls_seamless/os_6inch/14 \
+    --model Qwen/Qwen3-VL-2B-Instruct
+
+# Use a custom database path
+python3 nls_map_geocoder_llm.py --db my_area.db index --tiles nls_seamless/os_6inch/14
+```
 
 ### Step 3 — Query
 
 ```bash
 # What did the historic map call this location?
-python3 nls_map_geocoder.py query --lat 50.3653 --lon -4.0845
+python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845
 
 # Wider search radius
-python3 nls_map_geocoder.py query --lat 50.3653 --lon -4.0845 --radius 1000
+python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845 --radius 1000
 
-# Return more results
-python3 nls_map_geocoder.py query --lat 50.3653 --lon -4.0845 --radius 2000 --limit 20
+# Filter by feature type
+python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845 --type place
+python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845 --type road
 ```
 
 **Example output:**
 ```
 Historic map labels near (50.36530, -4.08450)  [within 300m]
 
-    Distance  Label                                  Lat          Lon
-  --------------------------------------------------------------------
-         87m  Plympton                          50.36612     -4.08321
-        142m  St-Mary                           50.36489     -4.08109
-        201m  Ridgeway                          50.36801     -4.08534
+    Distance  Type          Label                                Lat          Lon
+  --------------------------------------------------------------------------------
+         87m  place         Plympton                        50.36612     -4.08321
+        142m  place         St Mary                         50.36489     -4.08109
+        201m  road          Ridgeway                        50.36801     -4.08534
+        289m  water         Tory Brook                      50.36350     -4.08801
 ```
 
 **Index options:**
@@ -215,7 +248,8 @@ Historic map labels near (50.36530, -4.08450)  [within 300m]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--tiles` | required | Directory of downloaded tiles |
-| `--db` | `nls_geocoder.db` | SQLite database path |
+| `--model` | `Qwen/Qwen3-VL-4B-Instruct` | HuggingFace model ID |
+| `--db` | `nls_geocoder_llm.db` | SQLite database path |
 
 **Query options:**
 
@@ -225,7 +259,24 @@ Historic map labels near (50.36530, -4.08450)  [within 300m]
 | `--lon` | required | Longitude to query |
 | `--radius` | 300 | Search radius in metres |
 | `--limit` | 10 | Max results to return |
-| `--db` | `nls_geocoder.db` | SQLite database path |
+| `--type` | — | Filter by type: `place`, `road`, `water`, `field`, `building`, `elevation`, `boundary`, `other` |
+| `--db` | `nls_geocoder_llm.db` | SQLite database path |
+
+---
+
+### `nls_map_geocoder_ocr.py` — Tesseract OCR geocoder (lightweight alternative)
+
+A simpler implementation using Tesseract OCR. No GPU or large model download
+required, but results are noisier — it extracts raw character sequences without
+map context, so expect more false positives.
+
+```bash
+# Requires: pip install pytesseract && brew install tesseract
+python3 nls_map_geocoder_ocr.py index --tiles nls_seamless/os_6inch/15
+python3 nls_map_geocoder_ocr.py query --lat 50.3653 --lon -4.0845
+```
+
+> Best results at zoom 15–16 where map text is large enough for Tesseract.
 
 ---
 
