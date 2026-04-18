@@ -409,7 +409,9 @@ CREATE TABLE IF NOT EXISTS labels (
     zoom      INTEGER NOT NULL,
     tile_x    INTEGER NOT NULL,
     tile_y    INTEGER NOT NULL,
-    source    TEXT
+    source    TEXT,
+    UNIQUE(label, CAST(ROUND(lat,5) AS TEXT), CAST(ROUND(lon,5) AS TEXT))
+        ON CONFLICT REPLACE
 );
 CREATE INDEX IF NOT EXISTS idx_label_text ON labels(label COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_label_lat  ON labels(lat);
@@ -474,6 +476,9 @@ def cmd_index(args):
     grid    = 2 * radius + 1
     dedup_r = args.dedup_radius
     db_path = Path(args.db)
+    if args.overwrite and db_path.exists():
+        db_path.unlink()
+        print(f"Deleted existing database: {db_path}")
     conn    = open_db(db_path)
     model, processor = load_model(args.model)
 
@@ -671,6 +676,8 @@ def main():
                     help="Neighbourhood half-width: 1=3×3, 2=5×5 (default: 1)")
     pi.add_argument("--dedup-radius", type=float, default=50, metavar="METRES",
                     help="Merge duplicate labels within this distance in metres (default: 50)")
+    pi.add_argument("--overwrite", action="store_true",
+                    help="Delete existing database before indexing (default: append/replace)")
 
     # query
     pq = sub.add_parser("query", help="Reverse-geocode a lat/lon against the index")
