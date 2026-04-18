@@ -406,12 +406,13 @@ CREATE TABLE IF NOT EXISTS labels (
     type      TEXT    NOT NULL DEFAULT 'other',
     lat       REAL    NOT NULL,
     lon       REAL    NOT NULL,
+    lat_r     REAL    NOT NULL,
+    lon_r     REAL    NOT NULL,
     zoom      INTEGER NOT NULL,
     tile_x    INTEGER NOT NULL,
     tile_y    INTEGER NOT NULL,
     source    TEXT,
-    UNIQUE(label, CAST(ROUND(lat,5) AS TEXT), CAST(ROUND(lon,5) AS TEXT))
-        ON CONFLICT REPLACE
+    UNIQUE(label, lat_r, lon_r) ON CONFLICT REPLACE
 );
 CREATE INDEX IF NOT EXISTS idx_label_text ON labels(label COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_label_lat  ON labels(lat);
@@ -429,9 +430,10 @@ def open_db(path: Path) -> sqlite3.Connection:
 
 def insert_labels(conn: sqlite3.Connection, rows: list[tuple]):
     conn.executemany(
-        "INSERT INTO labels (label, type, lat, lon, zoom, tile_x, tile_y, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        rows,
+        "INSERT INTO labels (label, type, lat, lon, lat_r, lon_r, zoom, tile_x, tile_y, source) "
+        "VALUES (?, ?, ?, ?, ROUND(?,5), ROUND(?,5), ?, ?, ?, ?)",
+        # expand each row to supply lat and lon twice (once raw, once for rounding)
+        [(r[0], r[1], r[2], r[3], r[2], r[3], r[4], r[5], r[6], r[7]) for r in rows],
     )
     conn.commit()
 
