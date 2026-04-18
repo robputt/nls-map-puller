@@ -183,26 +183,36 @@ def composite_frac_to_latlon(
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
-    "You are a cartographic assistant specialising in historic British Ordnance Survey maps. "
-    "When shown a map image, extract every visible text label and classify it. "
-    "Return ONLY a JSON array — no prose, no markdown fences. "
+    "You are a cartographic assistant specialising in historic British Ordnance Survey maps "
+    "from the 19th and early 20th centuries.\n\n"
+    "Your task is to extract every text label visible in the map image and return it as a JSON array.\n\n"
+    "READING RULES:\n"
+    "- Labels may be horizontal, diagonal, or curved — read them in their natural direction\n"
+    "- Large area names (woods, parks, estates) are often set diagonally and spaced out across "
+    "the feature they describe — reconstruct the full name from the individual letters\n"
+    "- Decorative map symbols (trees, hedges, stippling dots) frequently appear BETWEEN the "
+    "letters of area names — ignore these symbols and read only the letterforms\n"
+    "- Names split across two lines should be joined into a single label "
+    "(e.g. 'Merafield' above 'Farm' → 'Merafield Farm')\n"
+    "- Apply your knowledge of British place names to resolve ambiguous readings — if a label "
+    "looks like a garbled version of a real British place name, use the correct spelling "
+    "(e.g. 'Saltiram' → 'Saltram', 'Plymton' → 'Plympton')\n\n"
+    "OUTPUT FORMAT — return ONLY a JSON array, no prose, no markdown fences.\n"
     "Each element must have exactly these keys:\n"
-    '  "label"    : the text exactly as it appears on the map. '
-    "If a name is split across two lines or interrupted by map symbols, "
-    "reconstruct the full name (e.g. 'Merafield' on one line and 'Farm' below it → 'Merafield Farm').\n"
-    '  "type"     : one of: place, road, water, field, building, elevation, boundary, other\n'
-    '  "x_frac"   : horizontal position of the label centre as a fraction 0.0–1.0 (left=0)\n'
-    '  "y_frac"   : vertical position of the label centre as a fraction 0.0–1.0 (top=0)\n'
-    "Rules:\n"
-    "- Include ALL text you can see, including small labels, abbreviations (e.g. G.P., F.P., B.M.) and field names.\n"
-    "- For split/two-line names, use the midpoint between the lines as y_frac.\n"
-    "- Omit map symbols, scale bars, and grid numbers.\n"
-    "- If no text labels are visible, return an empty array []."
+    '  "label"  : the corrected text as it should read\n'
+    '  "type"   : one of: place, road, water, field, building, elevation, boundary, other\n'
+    '  "x_frac" : horizontal centre of the label, 0.0 (left) to 1.0 (right)\n'
+    '  "y_frac" : vertical centre of the label, 0.0 (top) to 1.0 (bottom); '
+    "for diagonal or two-line labels use the midpoint of the full extent\n\n"
+    "INCLUDE: all place names, road names, water features, field names, building names, "
+    "abbreviations (G.P., B.M., F.P., W.)\n"
+    "EXCLUDE: map symbols, north arrows, scale bars, grid lines, pure numbers\n"
+    "If no text is visible, return []"
 )
 
 _USER_PROMPT = (
-    "Extract every text label from this historic OS map image, including any names "
-    "split across two lines or interrupted by symbols. "
+    "Extract every text label from this historic OS map image. "
+    "Pay particular attention to diagonal area names with symbols between the letters. "
     "Return a JSON array as instructed."
 )
 
@@ -243,7 +253,10 @@ def _preprocess(image: "Image.Image", zoom: int) -> "Image.Image":
     from PIL import Image, ImageOps, ImageEnhance
     img = image.convert("L")
     img = ImageOps.autocontrast(img, cutoff=1)
-    img = ImageEnhance.Sharpness(img).enhance(2.0)
+    # Sharpen less aggressively at high zoom — symbols are already large and
+    # over-sharpening makes them visually indistinguishable from letters
+    sharpen_amount = 2.0 if zoom <= 14 else 1.4
+    img = ImageEnhance.Sharpness(img).enhance(sharpen_amount)
 
     if zoom <= 13:
         scale = 2
