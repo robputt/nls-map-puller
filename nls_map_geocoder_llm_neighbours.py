@@ -187,16 +187,22 @@ _SYSTEM_PROMPT = (
     "When shown a map image, extract every visible text label and classify it. "
     "Return ONLY a JSON array — no prose, no markdown fences. "
     "Each element must have exactly these keys:\n"
-    '  "label"    : the text exactly as it appears on the map\n'
+    '  "label"    : the text exactly as it appears on the map. '
+    "If a name is split across two lines or interrupted by map symbols, "
+    "reconstruct the full name (e.g. 'Merafield' on one line and 'Farm' below it → 'Merafield Farm').\n"
     '  "type"     : one of: place, road, water, field, building, elevation, boundary, other\n'
     '  "x_frac"   : horizontal position of the label centre as a fraction 0.0–1.0 (left=0)\n'
     '  "y_frac"   : vertical position of the label centre as a fraction 0.0–1.0 (top=0)\n'
-    "Omit map symbols, scale bars, and grid numbers. "
-    "If no text labels are visible, return an empty array []."
+    "Rules:\n"
+    "- Include ALL text you can see, including small labels, abbreviations (e.g. G.P., F.P., B.M.) and field names.\n"
+    "- For split/two-line names, use the midpoint between the lines as y_frac.\n"
+    "- Omit map symbols, scale bars, and grid numbers.\n"
+    "- If no text labels are visible, return an empty array []."
 )
 
 _USER_PROMPT = (
-    "Extract all text labels from this historic OS map image. "
+    "Extract every text label from this historic OS map image, including any names "
+    "split across two lines or interrupted by symbols. "
     "Return a JSON array as instructed."
 )
 
@@ -226,10 +232,40 @@ def load_model(model_id: str):
     return model, processor
 
 
-def analyse_image(image, model, processor) -> list[dict]:
+def _preprocess(image: "Image.Image", zoom: int) -> "Image.Image":
+    """
+    Enhance a map tile for the VLM:
+    - Convert to greyscale to remove cream/sepia tint
+    - Boost contrast so ink is crisp black on white
+    - Upscale only at low zoom levels where text is small
+      (zoom <=13: 2×, zoom 14-15: 1.5×, zoom 16+: no upscale)
+    """
+    from PIL import Image, ImageOps, ImageEnhance
+    img = image.convert("L")
+    img = ImageOps.autocontrast(img, cutoff=1)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+
+    if zoom <= 13:
+        scale = 2
+    elif zoom <= 15:
+        scale = 1.5
+    else:
+        scale = 1  # zoom 16+ already has large text — no upscale needed
+
+    if scale != 1:
+        img = img.resize(
+            (int(img.width * scale), int(img.height * scale)),
+            Image.LANCZOS,
+        )
+    return img.convert("RGB")
+
+
+def analyse_image(image, model, processor, zoom: int = 14) -> list[dict]:
     """Run the VLM on a PIL image; return [{label, type, x_frac, y_frac}]."""
     from qwen_vl_utils import process_vision_info
     import torch
+
+    image = _preprocess(image, zoom)
 
     messages = [
         {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
@@ -443,7 +479,7 @@ def cmd_index(args):
         composite, tile_w, tile_h, origin_x, origin_y = build_composite(
             cx, cy, zoom, tile_index, radius,
         )
-        features = analyse_image(composite, model, processor)
+        features = analyse_image(composite, model, processor, zoom)
 
         rows = []
         for feat in features:
