@@ -13,7 +13,7 @@ No API key required. All maps are CC-BY licensed.
 |--------|-------------|
 | `nls_map_downloader.py` | Downloads individual paper map sheets (IIIF tiles) for a lat/lon point |
 | `nls_map_seamless_downloader.py` | Downloads seamless XYZ mosaic tiles for a bounding box |
-| `nls_map_geocoder_llm.py` | Indexes tiles with Qwen3-VL and builds a reverse-geocoding database (recommended) |
+| `nls_map_geocoder_llm_neighbours.py` | Indexes tiles with Qwen3-VL using neighbour stitching — recommended geocoder |
 | `nls_map_geocoder_ocr.py` | Indexes tiles with Tesseract OCR — lightweight but noisier |
 
 ---
@@ -171,21 +171,16 @@ nls_seamless/
 Two geocoder implementations are provided. Both share the same three-step
 workflow (download → index → query) and the same SQLite query interface.
 
-### `nls_map_geocoder_llm.py` — VLM geocoder (recommended)
+### `nls_map_geocoder_llm_neighbours.py` — VLM geocoder (recommended)
 
-Uses [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct),
-a local vision-language model, to read map tiles. Unlike raw OCR, the VLM
-understands cartographic context — it distinguishes place names from contour
-labels, classifies features by type (place, road, water, building, etc.), and
-estimates each label's position within the tile.
+Uses [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+to extract place names and map features from tiles. Before passing each tile to
+the model, it stitches a neighbourhood of surrounding tiles into a single
+composite image so that place names straddling tile boundaries are seen whole.
+Labels seen across multiple overlapping composites are deduplicated, keeping the
+most complete version of each name.
 
 The model (~8 GB) is downloaded from HuggingFace on first run and cached locally.
-
-**Install dependencies:**
-
-```bash
-pip install torch torchvision transformers accelerate qwen-vl-utils
-```
 
 **Hardware:**
 
@@ -207,28 +202,33 @@ python3 nls_map_seamless_downloader.py \
 ### Step 2 — Build the index
 
 ```bash
-python3 nls_map_geocoder_llm.py index --tiles nls_seamless/os_6inch/14
+python3 nls_map_geocoder_llm_neighbours.py index --tiles nls_seamless/os_6inch/14
 
 # Use the smaller 2B model on CPU
-python3 nls_map_geocoder_llm.py index --tiles nls_seamless/os_6inch/14 \
+python3 nls_map_geocoder_llm_neighbours.py index --tiles nls_seamless/os_6inch/14 \
     --model Qwen/Qwen3-VL-2B-Instruct
 
-# Use a custom database path
-python3 nls_map_geocoder_llm.py --db my_area.db index --tiles nls_seamless/os_6inch/14
+# 5×5 neighbourhood for large spread-out labels (e.g. county names)
+python3 nls_map_geocoder_llm_neighbours.py index --tiles nls_seamless/os_6inch/14 \
+    --neighbour-radius 2
+
+# Custom database path
+python3 nls_map_geocoder_llm_neighbours.py --db my_area.db index \
+    --tiles nls_seamless/os_6inch/14
 ```
 
 ### Step 3 — Query
 
 ```bash
 # What did the historic map call this location?
-python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845
+python3 nls_map_geocoder_llm_neighbours.py query --lat 50.3653 --lon -4.0845
 
 # Wider search radius
-python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845 --radius 1000
+python3 nls_map_geocoder_llm_neighbours.py query --lat 50.3653 --lon -4.0845 --radius 1000
 
 # Filter by feature type
-python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845 --type place
-python3 nls_map_geocoder_llm.py query --lat 50.3653 --lon -4.0845 --type road
+python3 nls_map_geocoder_llm_neighbours.py query --lat 50.3653 --lon -4.0845 --type place
+python3 nls_map_geocoder_llm_neighbours.py query --lat 50.3653 --lon -4.0845 --type road
 ```
 
 **Example output:**
@@ -249,7 +249,9 @@ Historic map labels near (50.36530, -4.08450)  [within 300m]
 |------|---------|-------------|
 | `--tiles` | required | Directory of downloaded tiles |
 | `--model` | `Qwen/Qwen3-VL-4B-Instruct` | HuggingFace model ID |
-| `--db` | `nls_geocoder_llm.db` | SQLite database path |
+| `--neighbour-radius` | 1 | Neighbourhood half-width: 1=3×3, 2=5×5 |
+| `--dedup-radius` | 50 | Merge duplicate labels within this distance (metres) |
+| `--db` | `nls_geocoder_llm_neighbours.db` | SQLite database path |
 
 **Query options:**
 
@@ -260,7 +262,7 @@ Historic map labels near (50.36530, -4.08450)  [within 300m]
 | `--radius` | 300 | Search radius in metres |
 | `--limit` | 10 | Max results to return |
 | `--type` | — | Filter by type: `place`, `road`, `water`, `field`, `building`, `elevation`, `boundary`, `other` |
-| `--db` | `nls_geocoder_llm.db` | SQLite database path |
+| `--db` | `nls_geocoder_llm_neighbours.db` | SQLite database path |
 
 ---
 
