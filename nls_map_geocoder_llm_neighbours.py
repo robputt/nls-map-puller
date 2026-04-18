@@ -440,8 +440,10 @@ def cmd_index(args):
     centres = sorted(tile_index.keys(), key=lambda c: (c[1], c[0]))
     print(f"\nIndexing {len(centres)} tiles as {grid}×{grid} composites → {db_path}\n")
 
-    # pending[(cx, cy)] = list of rows produced by composites that have seen this tile
-    pending: dict[tuple[int, int], list[tuple]] = {}
+    # composite_rows[(cx, cy)] = rows extracted from that composite
+    composite_rows: dict[tuple[int, int], list[tuple]] = {}
+    # track which composites have been processed
+    processed: set[tuple[int, int]] = set()
     total_written = 0
 
     for i, (cx, cy) in enumerate(centres, 1):
@@ -452,65 +454,88 @@ def cmd_index(args):
         )
         features = analyse_image(composite, model, processor)
 
-        # Distribute each extracted label into the pending bucket of every
-        # tile whose neighbourhood this composite covers.
-        new_rows = []
+        rows = []
         for feat in features:
             lat, lon = composite_frac_to_latlon(
                 feat["x_frac"], feat["y_frac"],
                 zoom, origin_x, origin_y, tile_w, tile_h, grid,
             )
-            row = (
+            rows.append((
                 feat["label"], feat["type"],
                 lat, lon,
                 zoom, cx, cy,
                 f"composite({cx},{cy},r={radius})",
-            )
-            new_rows.append(row)
-            # Add to every tile in this composite's footprint that exists
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    neighbour = (cx + dx, cy + dy)
-                    if neighbour in tile_index:
-                        pending.setdefault(neighbour, []).append(row)
+            ))
 
-        summary = ", ".join(f"{r[0]} ({r[1]})" for r in new_rows[:3])
-        if len(new_rows) > 3:
-            summary += f" … +{len(new_rows)-3} more"
-        print(f"→ {len(new_rows)} labels" + (f": {summary}" if new_rows else ""))
+        composite_rows[(cx, cy)] = rows
+        processed.add((cx, cy))
 
-        # A tile (tx, ty) is fully covered once every composite that could
-        # have seen it has been processed. The last such composite is centred
-        # at (tx + radius, ty + radius) in sorted order. After processing
-        # composite (cx, cy), flush any tile (tx, ty) where:
-        #   tx + radius <= cx  AND  ty + radius <= cy
-        # i.e. no future composite can add more labels for that tile.
+        summary = ", ".join(f"{r[0]} ({r[1]})" for r in rows[:3])
+        if len(rows) > 3:
+            summary += f" … +{len(rows)-3} more"
+        print(f"→ {len(rows)} labels" + (f": {summary}" if rows else ""))
+
+        # A tile (tx, ty) is fully covered once all (2r+1)² composites that
+        # could have seen it have been processed. Those composites are centred
+        # at (tx+dx, ty+dy) for dx,dy in [-radius, +radius]. The last one in
+        # our sort order is (tx+radius, ty+radius). So flush tile (tx, ty)
+        # once cx >= tx+radius AND cy >= ty+radius.
         to_flush = [
-            t for t in list(pending.keys())
-            if t[0] + radius <= cx and t[1] + radius <= cy
+            t for t in list(tile_index.keys())
+            if t not in processed  # haven't flushed it yet (reuse processed as flushed set)
+            and t[0] + radius <= cx
+            and t[1] + radius <= cy
         ]
+        # (ab)use processed to also track flushed tiles
         for t in to_flush:
-            tile_rows = pending.pop(t)
-            deduped   = deduplicate(tile_rows, dedup_r, radius)
+            tx, ty = t
+            # Gather rows from every composite whose footprint covers tile t
+            covering = [
+                row
+                for (ocx, ocy), orows in composite_rows.items()
+                for row in orows
+                if abs(ocx - tx) <= radius and abs(ocy - ty) <= radius
+            ]
+            deduped = deduplicate(covering, dedup_r, radius)
             insert_labels(conn, deduped)
             total_written += len(deduped)
+            processed.add(t)  # mark as flushed so we don't flush again
             print(
-                f"  → DB write: tile z{zoom}/{t[0]}/{t[1]} fully covered "
-                f"({len(tile_rows)} raw → {len(deduped)} labels stored, "
+                f"  → DB write: tile z{zoom}/{tx}/{ty} fully covered "
+                f"({len(covering)} raw → {len(deduped)} labels stored, "
                 f"{total_written} total)",
                 flush=True,
             )
 
-    # Flush whatever remains (edge tiles whose last composite was the final one)
-    if pending:
-        print(f"\nFlushing {len(pending)} remaining edge tile(s) …")
-        for t, tile_rows in pending.items():
-            deduped = deduplicate(tile_rows, dedup_r, radius)
+        # Evict composite_rows entries that can no longer contribute to any
+        # un-flushed tile, to keep memory bounded.
+        min_unflushed_x = min((t[0] for t in tile_index if t not in processed), default=cx)
+        min_unflushed_y = min((t[1] for t in tile_index if t not in processed), default=cy)
+        stale = [
+            k for k in list(composite_rows.keys())
+            if k[0] + radius < min_unflushed_x or k[1] + radius < min_unflushed_y
+        ]
+        for k in stale:
+            del composite_rows[k]
+
+    # Flush remaining tiles (right/bottom edges never satisfied the condition)
+    unflushed = [t for t in tile_index if t not in processed]
+    if unflushed:
+        print(f"\nFlushing {len(unflushed)} remaining edge tile(s) …")
+        for t in unflushed:
+            tx, ty = t
+            covering = [
+                row
+                for (ocx, ocy), orows in composite_rows.items()
+                for row in orows
+                if abs(ocx - tx) <= radius and abs(ocy - ty) <= radius
+            ]
+            deduped = deduplicate(covering, dedup_r, radius)
             insert_labels(conn, deduped)
             total_written += len(deduped)
             print(
-                f"  → DB write: tile z{zoom}/{t[0]}/{t[1]} (edge) "
-                f"({len(tile_rows)} raw → {len(deduped)} labels stored, "
+                f"  → DB write: tile z{zoom}/{tx}/{ty} (edge) "
+                f"({len(covering)} raw → {len(deduped)} labels stored, "
                 f"{total_written} total)",
                 flush=True,
             )
