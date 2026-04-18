@@ -301,15 +301,18 @@ def _parse_response(raw: str) -> list[dict]:
 
 def deduplicate(rows: list[tuple], radius_m: float, neighbour_radius: int) -> list[tuple]:
     """
-    Cluster rows that are candidates for being the same label instance.
+    Cluster rows that represent the same label instance.
 
-    Two rows are candidates only if:
-      1. Their centre tiles are within neighbour_radius steps of each other
-         (meaning their composites overlap and could both have seen the label), AND
-      2. Their label text matches (case-insensitive, or one is a substring), AND
-      3. Their coordinates are within radius_m of each other.
+    Two rows are merged when:
+      1. Their label text matches (case-insensitive, or one is a substring), AND
+      2. Their coordinates are within radius_m of each other.
 
     Within each cluster the longest (most complete) label wins.
+
+    The neighbour_radius parameter is accepted for API compatibility but is no
+    longer used as a filter — geographic proximity is sufficient to scope
+    deduplication correctly, since labels from non-overlapping areas will
+    naturally be further apart than any reasonable radius_m.
 
     rows: list of (label, type, lat, lon, zoom, tile_x, tile_y, source)
     """
@@ -317,22 +320,11 @@ def deduplicate(rows: list[tuple], radius_m: float, neighbour_radius: int) -> li
 
     for row in rows:
         label, lat, lon = row[0], row[2], row[3]
-        tile_x, tile_y  = row[5], row[6]
         norm = label.lower().strip()
 
         matched = False
         for idx, rep in enumerate(clusters):
-            rep_norm   = rep[0].lower().strip()
-            rep_tile_x = rep[5]
-            rep_tile_y = rep[6]
-
-            # Only consider merging if the composites could overlap
-            tiles_adjacent = (
-                abs(tile_x - rep_tile_x) <= neighbour_radius and
-                abs(tile_y - rep_tile_y) <= neighbour_radius
-            )
-            if not tiles_adjacent:
-                continue
+            rep_norm = rep[0].lower().strip()
 
             text_matches = (
                 norm == rep_norm or
