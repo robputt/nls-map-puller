@@ -595,6 +595,21 @@ def cmd_index(args):
 # Query command  (identical to nls_map_geocoder_llm.py)
 # ---------------------------------------------------------------------------
 
+def bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial bearing in degrees (0=N, 90=E, 180=S, 270=W)."""
+    lat1, lat2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def bearing_to_compass(deg: float) -> str:
+    """Convert a bearing in degrees to an 8-point compass label."""
+    points = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return points[round(deg / 45) % 8]
+
+
 def cmd_query(args):
     db_path = Path(args.db)
     if not db_path.exists():
@@ -628,7 +643,8 @@ def cmd_query(args):
     for label, kind, rlat, rlon in rows:
         dist = haversine_m(lat, lon, rlat, rlon)
         if dist <= radius_m:
-            results.append((dist, label, kind, rlat, rlon))
+            b = bearing(lat, lon, rlat, rlon)
+            results.append((dist, b, label, kind, rlat, rlon))
 
     results.sort()
     results = results[:limit]
@@ -643,10 +659,11 @@ def cmd_query(args):
     type_note = f"  type={type_filter}" if type_filter else ""
     print(f"\nHistoric map labels near ({lat:.5f}, {lon:.5f})  "
           f"[within {radius_m:.0f}m{type_note}]\n")
-    print(f"  {'Distance':>10}  {'Type':<12}  {'Label':<35}  {'Lat':>10}  {'Lon':>11}")
-    print("  " + "-" * 82)
-    for dist, label, kind, rlat, rlon in results:
-        print(f"  {dist:>9.0f}m  {kind:<12}  {label:<35}  {rlat:>10.5f}  {rlon:>11.5f}")
+    print(f"  {'Distance':>10}  {'Hdg':>5}  {'Dir':>3}  {'Type':<12}  {'Label':<35}  {'Lat':>10}  {'Lon':>11}")
+    print("  " + "-" * 96)
+    for dist, b, label, kind, rlat, rlon in results:
+        compass = bearing_to_compass(b)
+        print(f"  {dist:>9.0f}m  {b:>4.0f}°  {compass:>3}  {kind:<12}  {label:<35}  {rlat:>10.5f}  {rlon:>11.5f}")
     print()
 
 
