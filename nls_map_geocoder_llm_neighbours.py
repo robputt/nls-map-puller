@@ -647,7 +647,8 @@ def cmd_query(args):
             results.append((dist, b, label, kind, rlat, rlon))
 
     results.sort()
-    results = results[:limit]
+    if limit:
+        results = results[:limit]
 
     if not results:
         msg = f"No labels found within {radius_m}m of ({lat}, {lon})"
@@ -704,8 +705,8 @@ def main():
     pq.add_argument("--lon",    type=float, required=True)
     pq.add_argument("--radius", type=float, default=300,
                     help="Search radius in metres (default: 300)")
-    pq.add_argument("--limit",  type=int,   default=10,
-                    help="Max results (default: 10)")
+    pq.add_argument("--limit",  type=int,   default=0,
+                    help="Max results (default: 0 = all)")
     pq.add_argument("--type",   default=None,
                     help="Filter by type: place, road, water, field, "
                          "building, elevation, boundary, other")
