@@ -610,6 +610,8 @@ def bearing_to_compass(deg: float) -> str:
     return points[round(deg / 45) % 8]
 
 
+DEFAULT_TYPES = {"place", "building", "water", "road"}
+
 def cmd_query(args):
     db_path = Path(args.db)
     if not db_path.exists():
@@ -619,7 +621,14 @@ def cmd_query(args):
     lat, lon   = args.lat, args.lon
     radius_m   = args.radius
     limit      = args.limit
-    type_filter = args.type
+
+    # Resolve which types to show
+    if args.all_types:
+        active_types = None  # no filter
+    elif args.type:
+        active_types = {t.strip().lower() for t in args.type.split(",")}
+    else:
+        active_types = DEFAULT_TYPES
 
     dlat = radius_m / 111_000
     dlon = radius_m / (111_000 * math.cos(math.radians(lat)))
@@ -632,9 +641,10 @@ def cmd_query(args):
     """
     params: list = [lat - dlat, lat + dlat, lon - dlon, lon + dlon]
 
-    if type_filter:
-        sql += " AND type = ?"
-        params.append(type_filter.lower())
+    if active_types:
+        placeholders = ",".join("?" * len(active_types))
+        sql += f" AND type IN ({placeholders})"
+        params.extend(active_types)
 
     rows = conn.execute(sql, params).fetchall()
     conn.close()
@@ -651,13 +661,11 @@ def cmd_query(args):
         results = results[:limit]
 
     if not results:
-        msg = f"No labels found within {radius_m}m of ({lat}, {lon})"
-        if type_filter:
-            msg += f" with type '{type_filter}'"
-        print(msg + ".")
+        type_note = f" of type(s) {sorted(active_types)}" if active_types else ""
+        print(f"No labels found within {radius_m}m of ({lat}, {lon}){type_note}.")
         return
 
-    type_note = f"  type={type_filter}" if type_filter else ""
+    type_note = f"  types={','.join(sorted(active_types))}" if active_types else "  all types"
     print(f"\nHistoric map labels near ({lat:.5f}, {lon:.5f})  "
           f"[within {radius_m:.0f}m{type_note}]\n")
     print(f"  {'Distance':>10}  {'Hdg':>5}  {'Dir':>3}  {'Type':<12}  {'Label':<35}  {'Lat':>10}  {'Lon':>11}")
@@ -708,8 +716,10 @@ def main():
     pq.add_argument("--limit",  type=int,   default=0,
                     help="Max results (default: 0 = all)")
     pq.add_argument("--type",   default=None,
-                    help="Filter by type: place, road, water, field, "
-                         "building, elevation, boundary, other")
+                    help="Comma-separated types to show, e.g. place,road "
+                         "(default: place,building,water,road)")
+    pq.add_argument("--all-types", action="store_true",
+                    help="Show all feature types including elevation, field, boundary, other")
 
     args = p.parse_args()
     if args.cmd == "index":
