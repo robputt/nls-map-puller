@@ -610,7 +610,7 @@ def bearing_to_compass(deg: float) -> str:
     return points[round(deg / 45) % 8]
 
 
-DEFAULT_TYPES = {"place", "building", "water", "road"}
+DEFAULT_TYPES = {"place", "building", "water", "road", "field"}
 
 def cmd_query(args):
     db_path = Path(args.db)
